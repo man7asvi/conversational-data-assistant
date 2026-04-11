@@ -24,7 +24,7 @@ function Table({ data }) {
             <tr key={i} className="border-b last:border-0 hover:bg-muted/30 transition-colors">
               {columns.map(col => (
                 <td key={col} className="px-4 py-2">
-                  {row[col]}
+                  {typeof row[col] === 'boolean' ? String(row[col]) : row[col]}
                 </td>
               ))}
             </tr>
@@ -39,6 +39,7 @@ function App() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState("")
   const [loading, setLoading] = useState(false)
+  const [history, setHistory] = useState([])
   const messagesEndRef = useRef(null)
 
   useEffect(() => {
@@ -53,16 +54,35 @@ function App() {
     setInput("")
     setLoading(true)
 
+    // Add user message to history before sending
+    const updatedHistory = [
+      ...history,
+      { role: "user", content: input }
+    ]
+
     const response = await fetch("http://localhost:8000/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: input }),
+      body: JSON.stringify({
+        text: input,
+        history: updatedHistory.slice(-4)
+      }),
     })
 
     const data = await response.json()
     const botMessage = { sender: "bot", text: data.reply, type: data.type }
     setMessages(prev => [...prev, botMessage])
     setLoading(false)
+
+    // Add assistant reply to history
+    const replyText = data.type === "table"
+      ? `Returned ${data.reply.length} rows`
+      : data.reply
+
+    setHistory([
+      ...updatedHistory,
+      { role: "assistant", content: replyText }
+    ])
   }
 
   return (
