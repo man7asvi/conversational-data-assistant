@@ -2,7 +2,9 @@ from typing import Optional, List
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import os
 from nlu import parse
 from validator import validate_sql, SQLValidationError
 from llm_service import extract_sql_query
@@ -27,12 +29,18 @@ class Message(BaseModel):
     history: Optional[List[ConversationMessage]] = []
 
 
-def query_db(query:str, params:tuple=()):
-    conn=sqlite3.connect("sales.db")
-    conn.row_factory=sqlite3.Row
-    cursor=conn.cursor()
-    cursor.execute(query,params)
-    rows=cursor.fetchall()
+def query_db(query: str, params: tuple = ()):
+    conn = psycopg2.connect(
+        host=os.getenv("DB_HOST"),
+        port=os.getenv("DB_PORT"),
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        options=f"-c search_path={os.getenv('DB_SCHEMA')}"
+    )
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
@@ -51,7 +59,7 @@ def chat(message: Message):
         }
 
     try:
-        llm_output = extract_sql_query(text, history)
+        llm_output = extract_sql_query(text)
         print("LLM output:", llm_output)
 
         sql = llm_output.get("sql")
@@ -64,12 +72,15 @@ def chat(message: Message):
             }
 
         safe_sql = validate_sql(
-            sql,
-            allowed_tables=["sales"],
-            require_limit=True
+        sql,
+        allowed_tables=["customers", "orders", "order_details", "products", 
+                        "employees", "categories", "suppliers", "shippers",
+                        "territories", "region", "us_states"],
+        require_limit=True
         )
 
         result = query_db(safe_sql, params)
+        print(f"Database result: {result}")
 
         return {
             "reply": result,
