@@ -1,3 +1,5 @@
 .env
 node_modules/
-backend/__pycache__/
+backend/sales.db
+**/*.pyc
+**/__pycache__/
