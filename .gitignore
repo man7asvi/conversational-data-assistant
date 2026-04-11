@@ -2,3 +2,4 @@
 node_modules/
 backend/sales.db
 **/*.pyc
+**/__pycache__/
