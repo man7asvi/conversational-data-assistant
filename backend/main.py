@@ -15,7 +15,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:3001"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -59,7 +59,7 @@ def chat(message: Message):
         }
 
     try:
-        llm_output = extract_sql_query(text)
+        llm_output = extract_sql_query(text,history)
         print("LLM output:", llm_output)
 
         sql = llm_output.get("sql")

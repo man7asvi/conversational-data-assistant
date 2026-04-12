@@ -141,6 +141,6 @@ def extract_sql_query(user_text: str, history: list = []):
     except:
         print("❌ Bad SQL JSON:", raw_output)
         return {
-            "sql": "SELECT * FROM sales LIMIT 10",
+            "sql": "SELECT * FROM products LIMIT 10",
             "params": []
         }
