@@ -115,13 +115,31 @@ User:
 {user_text}
 """
 
-def extract_sql_query(user_text: str, history: list = []):
+def extract_sql_query(user_text: str, conversation_state=None):
+    """Generate SQL query from user text."""
     prompt = build_prompt(user_text)
 
-    messages=[{"role": "system", "content": "Return only JSON"}]
-    for msg in history[-4:]:
-        messages.append({"role": msg["role"], "content": msg["content"]})
-
+    messages = [{"role": "system", "content": "Return only JSON"}]
+    
+    # Build context from conversation state if provided
+    if conversation_state:
+        context_block = _build_context_block(conversation_state)
+        if context_block:
+            print(f"\n{'='*60}")
+            print(f"📋 CONTEXT BEING SENT TO LLM:")
+            print(f"{'='*60}")
+            print(context_block)
+            print(f"{'='*60}\n")
+            messages.append({"role": "system", "content": context_block})
+    
+    # Add last 3-4 messages from conversation for context
+    if conversation_state and conversation_state.messages:
+        print(f"📜 CONVERSATION HISTORY ({len(conversation_state.messages)} messages total):")
+        for msg in conversation_state.get_last_n_messages(4):
+            print(f"   {msg.role}: {msg.content[:100]}...")
+        for msg in conversation_state.get_last_n_messages(4):
+            messages.append({"role": msg.role, "content": msg.content})
+    
     messages.append({"role": "user", "content": prompt})
 
     response = client.chat.completions.create(
@@ -144,3 +162,38 @@ def extract_sql_query(user_text: str, history: list = []):
             "sql": "SELECT * FROM products LIMIT 10",
             "params": []
         }
+
+
+def _build_context_block(conversation_state) -> str:
+    """
+    Build a system context block from conversation state.
+    Includes last SQL, tables used, and PREVIOUS RESULTS for context.
+    """
+    lines = ["--- CONVERSATION CONTEXT ---"]
+    
+    if conversation_state.last_sql_generated:
+        lines.append(f"Last SQL generated: {conversation_state.last_sql_generated}")
+    
+    if conversation_state.tables_used:
+        lines.append(f"Tables referenced so far: {', '.join(conversation_state.tables_used)}")
+    
+    # Add previous messages with ACTUAL RESULTS for better context
+    if conversation_state.messages:
+        lines.append("\n--- CONVERSATION HISTORY WITH RESULTS ---")
+        for msg in conversation_state.get_last_n_messages(3):
+            if msg.role == "user":
+                lines.append(f"\nUser asked: {msg.content}")
+            else:
+                # Show what the assistant replied with
+                if msg.sql_generated:
+                    lines.append(f"Assistant generated SQL: {msg.sql_generated[:150]}...")
+                    # Include the summary which hints at results
+                    lines.append(f"Result summary: {msg.content}")
+    
+    if conversation_state.filters_applied:
+        lines.append(f"\nFilters applied: {', '.join(conversation_state.filters_applied)}")
+    
+    lines.append("\n--- END CONTEXT ---")
+    lines.append("\nIMPORTANT: When user refers to 'their', 'those', 'them', build queries that reference entities from previous results using IN (...) or subqueries.")
+    
+    return "\n".join(lines) if len(lines) > 2 else ""

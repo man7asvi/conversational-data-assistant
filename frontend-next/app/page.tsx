@@ -82,15 +82,57 @@ export default function Home() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [history, setHistory] = useState<{ role: string; content: string }[]>([])
+  const [conversationId, setConversationId] = useState<string>('')
+  const [conversationLoading, setConversationLoading] = useState(true)
+  const [error, setError] = useState<string>('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
+
+  // Initialize conversation on mount
+  useEffect(() => {
+    initializeConversation()
+  }, [])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  const initializeConversation = async () => {
+    try {
+      console.log('Initializing conversation (skipping health check)...')
+      
+      console.log('Creating conversation...')
+      const response = await fetch('/api/conversations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: 'New Chat' }),
+      })
+      
+      console.log('Response status:', response.status)
+      const data = await response.json()
+      console.log('Response data:', data)
+      
+      if (!response.ok) {
+        throw new Error(data.detail || data.error || `HTTP ${response.status}`)
+      }
+      
+      if (!data.conversation_id) {
+        throw new Error('No conversation_id in response')
+      }
+      
+      setConversationId(data.conversation_id)
+      setError('')
+      console.log('✅ Conversation initialized:', data.conversation_id)
+    } catch (err) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      console.error('Failed to initialize:', errorMsg, err)
+      setError(`Failed to initialize chat: ${errorMsg}`)
+    } finally {
+      setConversationLoading(false)
+    }
+  }
+
   const handleExecute = async (sql: string, params: any[], msgIndex: number) => {
-    const response = await fetch('http://localhost:8000/execute', {
+    const response = await fetch('/api/execute', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sql, params }),
@@ -102,11 +144,6 @@ export default function Home() {
         ? { ...msg, type: 'table', data: data.reply }
         : msg
     ))
-
-    setHistory(prev => [...prev, {
-      role: 'assistant',
-      content: `Returned ${data.reply?.length ?? 0} rows`
-    }])
   }
 
   const handleCancel = (msgIndex: number) => {
@@ -117,57 +154,121 @@ export default function Home() {
     ))
   }
 
-  const sendMessage = async () => {
-    if (!input.trim() || loading) return
+  const handleSuggestionClick = async (suggestion: string) => {
+    if (!conversationId || loading) return
 
     const userMsg: Message = {
       id: Date.now().toString(),
       role: 'user',
-      content: input,
+      content: suggestion,
       type: 'text'
     }
 
     setMessages(prev => [...prev, userMsg])
     setInput('')
     setLoading(true)
+    setError('')
 
-    const updatedHistory = [...history, { role: 'user', content: input }]
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          conversation_id: conversationId,
+          text: suggestion,
+        }),
+      })
 
-    const response = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        text: input,
-        history: updatedHistory.slice(-4)
-      }),
-    })
+      if (!response.ok) {
+        throw new Error(`API error: ${response.statusText}`)
+      }
 
-    const data = await response.json()
-    setLoading(false)
+      const data = await response.json()
+      setLoading(false)
 
-    if (data.type === 'preview') {
-      setMessages(prev => [...prev, {
-        id: Date.now().toString(),
-        role: 'assistant',
-        content: '',
-        type: 'preview',
-        sql: data.sql,
-        params: data.params
-      }])
-    } else {
-      setMessages(prev => [...prev, {
-        id: Date.now().toString(),
-        role: 'assistant',
-        content: data.type === 'table' ? '' : data.reply,
-        type: data.type,
-        data: data.type === 'table' ? data.reply : undefined
-      }])
+      if (data.type === 'preview') {
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: '',
+          type: 'preview',
+          sql: data.sql,
+          params: data.params
+        }])
+      } else {
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: data.type === 'table' ? '' : data.reply,
+          type: data.type,
+          data: data.type === 'table' ? data.reply : undefined
+        }])
+      }
+    } catch (err) {
+      setLoading(false)
+      const errorMsg = err instanceof Error ? err.message : 'Unknown error'
+      setError(errorMsg)
+      console.error('Error:', err)
+    }
+  }
 
-      const replyText = data.type === 'table'
-        ? `Returned ${data.reply?.length ?? 0} rows`
-        : data.reply
+  const sendMessage = async () => {
+    if (!input.trim() || loading || !conversationId) return
 
-      setHistory([...updatedHistory, { role: 'assistant', content: replyText }])
+    const messageText = input // Save input before clearing
+    
+    const userMsg: Message = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: messageText,
+      type: 'text'
+    }
+
+    setMessages(prev => [...prev, userMsg])
+    setInput('')
+    setLoading(true)
+    setError('')
+
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          conversation_id: conversationId,
+          text: messageText,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`API error: ${response.statusText}`)
+      }
+
+      const data = await response.json()
+      setLoading(false)
+
+      if (data.type === 'preview') {
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: '',
+          type: 'preview',
+          sql: data.sql,
+          params: data.params
+        }])
+      } else {
+        setMessages(prev => [...prev, {
+          id: Date.now().toString(),
+          role: 'assistant',
+          content: data.type === 'table' ? '' : data.reply,
+          type: data.type,
+          data: data.type === 'table' ? data.reply : undefined
+        }])
+      }
+    } catch (err) {
+      setLoading(false)
+      const errorMsg = err instanceof Error ? err.message : 'Something went wrong'
+      setError(errorMsg)
+      console.error('Chat error:', err)
     }
   }
 
@@ -177,10 +278,18 @@ export default function Home() {
 
         {/* Header */}
         <div className="flex items-center gap-3">
-          <div className="w-2 h-2 rounded-full bg-green-500 animate-pulse" />
+          <div className={`w-2 h-2 rounded-full animate-pulse ${error ? 'bg-red-500' : 'bg-green-500'}`} />
           <h1 className="text-xl font-semibold">Conversational Data Assistant</h1>
-          <span className="text-xs text-muted-foreground ml-auto">Northwind DB</span>
+          <span className="text-xs text-muted-foreground ml-auto">
+            {conversationLoading ? 'Initializing...' : 'Northwind DB'}
+          </span>
         </div>
+
+        {error && (
+          <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-lg text-sm text-red-600">
+            {error}
+          </div>
+        )}
 
         {/* Chat window */}
         <div className="flex flex-col bg-card rounded-2xl border overflow-hidden h-[600px]">
@@ -197,8 +306,9 @@ export default function Home() {
                 ].map(suggestion => (
                     <button
                       key={suggestion}
-                      onClick={() => setInput(suggestion)}
-                      className="text-xs px-3 py-1.5 rounded-full bg-secondary hover:bg-secondary/80 text-secondary-foreground transition-colors"
+                      onClick={() => handleSuggestionClick(suggestion)}
+                      disabled={!conversationId || loading}
+                      className="text-xs px-3 py-1.5 rounded-full bg-secondary hover:bg-secondary/80 disabled:opacity-50 text-secondary-foreground transition-colors"
                     >
                       {suggestion}
                     </button>
@@ -257,7 +367,7 @@ export default function Home() {
             />
             <button
               onClick={sendMessage}
-              disabled={loading}
+              disabled={loading || conversationLoading}
               className="px-5 py-2.5 bg-primary hover:bg-primary/90 disabled:opacity-50 text-primary-foreground text-sm rounded-xl transition-colors font-medium"
             >
               Send
