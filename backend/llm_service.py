@@ -167,7 +167,7 @@ def extract_sql_query(user_text: str, conversation_state=None):
 def _build_context_block(conversation_state) -> str:
     """
     Build a system context block from conversation state.
-    Includes last SQL, tables used, and PREVIOUS RESULTS for context.
+    Includes last SQL, tables used, and actual previous results for context.
     """
     lines = ["--- CONVERSATION CONTEXT ---"]
     
@@ -177,23 +177,21 @@ def _build_context_block(conversation_state) -> str:
     if conversation_state.tables_used:
         lines.append(f"Tables referenced so far: {', '.join(conversation_state.tables_used)}")
     
-    # Add previous messages with ACTUAL RESULTS for better context
+    # Add previous messages with ACTUAL RESULTS
     if conversation_state.messages:
-        lines.append("\n--- CONVERSATION HISTORY WITH RESULTS ---")
+        lines.append("\n--- CONVERSATION HISTORY ---")
         for msg in conversation_state.get_last_n_messages(3):
             if msg.role == "user":
-                lines.append(f"\nUser asked: {msg.content}")
+                lines.append(f"User asked: {msg.content}")
             else:
-                # Show what the assistant replied with
                 if msg.sql_generated:
-                    lines.append(f"Assistant generated SQL: {msg.sql_generated[:150]}...")
-                    # Include the summary which hints at results
-                    lines.append(f"Result summary: {msg.content}")
+                    lines.append(f"Assistant SQL: {msg.sql_generated[:200]}...")
+                    lines.append(f"Response: {msg.content}")
     
     if conversation_state.filters_applied:
         lines.append(f"\nFilters applied: {', '.join(conversation_state.filters_applied)}")
     
     lines.append("\n--- END CONTEXT ---")
-    lines.append("\nIMPORTANT: When user refers to 'their', 'those', 'them', build queries that reference entities from previous results using IN (...) or subqueries.")
+    lines.append("\nIMPORTANT: When user refers to 'their', 'those', 'them', use the actual values from previous results in IN (...) clauses.")
     
     return "\n".join(lines) if len(lines) > 2 else ""

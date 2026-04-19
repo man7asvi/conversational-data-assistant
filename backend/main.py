@@ -7,6 +7,7 @@ from psycopg2.extras import RealDictCursor
 import os
 from uuid import UUID
 import re
+import json
 
 try:
     from nlu import parse
@@ -21,14 +22,20 @@ except ImportError:
 
 from llm_service import extract_sql_query
 from models import ConversationState
-from session_store import InMemorySessionStore
+from db_manager import DatabaseManager, get_storage_db_config
+from postgres_session_store import PostgresSessionStore
 
-
-# python3 -m uvicorn main:app --reload
+# ============================================================================
+# Initialize FastAPI and Session Store
+# ============================================================================
 app = FastAPI()
 
-# Initialize the session store (in-memory for now, swap for PostgresSessionStore later)
-session_store = InMemorySessionStore()
+# Initialize the PostgreSQL session store for conversation persistence
+storage_db_config = get_storage_db_config()
+session_store = PostgresSessionStore(storage_db_config)
+
+# Initialize database manager for multi-database support
+db_manager = DatabaseManager(storage_db_config)
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,26 +52,27 @@ def health():
     return {
         "status": "ok",
         "session_store_type": type(session_store).__name__,
+        "databases_loaded": len(db_manager.list_databases()),
     }
 
 # Request models
 class ChatRequest(BaseModel):
     conversation_id: str  # UUID as string
     text: str
+    database_name: Optional[str] = "northwind"  # Default to northwind
 
 class CreateConversationRequest(BaseModel):
     title: str = "New Conversation"
+    database_name: str = "northwind"
 
 
-def query_db(query: str, params: tuple = ()):
-    conn = psycopg2.connect(
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT"),
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        options=f"-c search_path={os.getenv('DB_SCHEMA')}"
-    )
+def query_db(query: str, params: tuple = (), database_name: str = "northwind"):
+    """Execute query against a specific database."""
+    db_config = db_manager.get_database(database_name)
+    if not db_config:
+        raise ValueError(f"Database '{database_name}' not found")
+    
+    conn = psycopg2.connect(**db_config.get_connection_string())
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     cursor.execute(query, params)
     rows = cursor.fetchall()
@@ -72,23 +80,50 @@ def query_db(query: str, params: tuple = ()):
     return [dict(row) for row in rows]
 
 
-# ============= CONVERSATION MANAGEMENT ENDPOINTS =============
+# ============================================================================
+# DATABASE MANAGEMENT ENDPOINTS
+# ============================================================================
+
+@app.get("/databases")
+def list_databases():
+    """List all available databases."""
+    databases = db_manager.list_databases()
+    return {"databases": databases}
+
+
+@app.get("/databases/{name}/test")
+def test_database_connection(name: str):
+    """Test connection to a database."""
+    success = db_manager.test_connection(name)
+    return {
+        "database": name,
+        "connected": success
+    }
+
+
+# ============================================================================
+# CONVERSATION MANAGEMENT ENDPOINTS
+# ============================================================================
 
 @app.post("/conversations")
 def create_conversation(request: CreateConversationRequest):
     """Create a new conversation."""
-    state = session_store.create_conversation(request.title)
+    state = session_store.create_conversation(
+        request.title, 
+        request.database_name
+    )
     return {
         "conversation_id": str(state.conversation_id),
         "title": state.title,
+        "database_name": request.database_name,
         "created_at": state.created_at.isoformat(),
     }
 
 
 @app.get("/conversations")
-def list_conversations():
-    """List all conversations (for sidebar)."""
-    conversations = session_store.list_conversations()
+def list_conversations(database_name: Optional[str] = None):
+    """List all conversations, optionally filtered by database."""
+    conversations = session_store.list_conversations(database_name)
     return [
         {
             "conversation_id": str(c.conversation_id),
@@ -130,30 +165,45 @@ def delete_conversation(conversation_id: str):
     
     return {"status": "deleted", "conversation_id": conversation_id}
 
+
+# ============================================================================
+# CHAT ENDPOINT
+# ============================================================================
+
 @app.post("/chat")
 def chat(request: ChatRequest):
-    """Chat endpoint. Backend owns all conversation state."""
+    """
+    Chat endpoint. Backend owns all conversation state.
+    Frontend sends: conversation_id + text (no history)
+    """
     try:
         conversation_id = UUID(request.conversation_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid conversation_id format")
     
     text = request.text.strip()
+    database_name = request.database_name or "northwind"
     
+    # Retrieve conversation state
     state = session_store.get_conversation(conversation_id)
     if not state:
         raise HTTPException(status_code=404, detail="Conversation not found")
     
-    print(f"Chat in conversation {conversation_id}: '{text}'")
+    print(f"Chat in conversation {conversation_id}: '{text}' (database: {database_name})")
 
     dangerous_words = ["delete", "drop", "remove", "truncate", "update", "insert"]
 
     if any(word in text.lower() for word in dangerous_words):
+        # Save user message and error response
         session_store.save_message(conversation_id, "user", text)
         session_store.save_message(conversation_id, "assistant", "This operation is not allowed.")
-        return {"reply": "This operation is not allowed.", "type": "text"}
+        return {
+            "reply": "This operation is not allowed.",
+            "type": "text"
+        }
 
     try:
+        # Extract SQL using conversation state for rich context
         llm_output = extract_sql_query(text, state)
         print("LLM output:", llm_output)
 
@@ -163,13 +213,14 @@ def chat(request: ChatRequest):
         if not sql:
             session_store.save_message(conversation_id, "user", text)
             session_store.save_message(conversation_id, "assistant", "Could not generate SQL.")
-            return {"reply": "Could not generate SQL.", "type": "text"}
+            return {
+                "reply": "Could not generate SQL.",
+                "type": "text"
+            }
 
         # FIX: Replace single %s with correct number of placeholders for IN clauses
         param_count = len(params)
         if param_count > 0:
-            # Replace IN (%s) with IN (%s, %s, ...) for lists
-            import re
             in_pattern = r'IN \(%s\)'
             if re.search(in_pattern, sql):
                 placeholders = ', '.join(['%s'] * param_count)
@@ -183,14 +234,20 @@ def chat(request: ChatRequest):
             require_limit=True
         )
 
-        result = query_db(safe_sql, params)
+        result = query_db(safe_sql, params, database_name)
         print(f"Database result: {result}")
 
-        session_store.save_message(conversation_id, "user", text)
+        # Save conversation: user message, SQL, and result summary
+        session_store.save_message(
+            conversation_id, 
+            "user", 
+            text
+        )
+        result_summary = f"Returned {len(result)} rows with data: {json.dumps(result[:3], default=str)}" if result else "Returned 0 rows"
         session_store.save_message(
             conversation_id, 
             "assistant",
-            f"Returned {len(result)} rows",
+            result_summary,
             sql_generated=safe_sql,
             params_used=list(params)
         )
@@ -205,10 +262,16 @@ def chat(request: ChatRequest):
     except SQLValidationError as e:
         session_store.save_message(conversation_id, "user", text)
         session_store.save_message(conversation_id, "assistant", f"Query blocked: {str(e)}")
-        return {"reply": f"Query blocked: {str(e)}", "type": "text"}
+        return {
+            "reply": f"Query blocked: {str(e)}",
+            "type": "text"
+        }
 
     except Exception as e:
         print("Error:", e)
         session_store.save_message(conversation_id, "user", text)
         session_store.save_message(conversation_id, "assistant", f"Something went wrong: {str(e)}")
-        return {"reply": f"Something went wrong: {str(e)}", "type": "text"}
+        return {
+            "reply": f"Something went wrong: {str(e)}",
+            "type": "text"
+        }
