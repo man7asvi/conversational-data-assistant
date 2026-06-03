@@ -232,19 +232,23 @@ class PostgresSessionStore(SessionStore):
             if database_name:
                 cursor.execute(
                     """
-                    SELECT id, title, created_at, updated_at, database_name
-                    FROM conversations
-                    WHERE database_name = %s
-                    ORDER BY updated_at DESC
+                    SELECT c.id, c.title, c.created_at, c.updated_at, c.database_name, COUNT(m.id) as message_count
+                    FROM conversations c
+                    LEFT JOIN messages m ON c.id = m.conversation_id
+                    WHERE c.database_name = %s
+                    GROUP BY c.id, c.title, c.created_at, c.updated_at, c.database_name
+                    ORDER BY c.updated_at DESC
                     """,
                     (database_name,)
                 )
             else:
                 cursor.execute(
                     """
-                    SELECT id, title, created_at, updated_at, database_name
-                    FROM conversations
-                    ORDER BY updated_at DESC
+                    SELECT c.id, c.title, c.created_at, c.updated_at, c.database_name, COUNT(m.id) as message_count
+                    FROM conversations c
+                    LEFT JOIN messages m ON c.id = m.conversation_id
+                    GROUP BY c.id, c.title, c.created_at, c.updated_at, c.database_name
+                    ORDER BY c.updated_at DESC
                     """
                 )
             
@@ -260,6 +264,8 @@ class PostgresSessionStore(SessionStore):
                     created_at=row["created_at"],
                     updated_at=row["updated_at"]
                 )
+                # Manually add message_count to the state for frontend
+                state.message_count = row["message_count"]
                 conversations.append(state)
             
             return conversations
