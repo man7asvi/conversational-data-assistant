@@ -22,7 +22,7 @@ except ImportError:
     validate_sql = None
     SQLValidationError = None
 
-from llm_service import extract_sql_query, fix_sql_with_error
+from llm_service import extract_sql_query, fix_sql_with_error, generate_conversation_title
 from models import ConversationState
 from db_manager import DatabaseManager, get_storage_db_config
 from postgres_session_store import PostgresSessionStore
@@ -302,6 +302,19 @@ def chat(request: ChatRequest):
             params_used=list(params)
         )
 
+         # ── Auto-title on first message ───────────────────────────────────
+        # state.messages was loaded BEFORE we saved this turn, so if it was
+        # empty then this is the first ever message in the conversation.
+        # We generate a short title and update the DB immediately.
+        new_title = None
+        if len(state.messages) == 0:
+            try:
+                new_title = generate_conversation_title(text)
+                session_store.update_conversation_title(conversation_id, new_title)
+                print(f"✅ Auto-title set: '{new_title}'")
+            except Exception as title_err:
+                print(f"⚠️  Title generation failed (non-fatal): {title_err}")
+
         # When the query ran fine but returned nothing, tell the user clearly.
         # "type: empty" lets the frontend show the SQL (so the user can see what
         # ran) alongside a human-readable explanation instead of just blank space.
@@ -310,14 +323,16 @@ def chat(request: ChatRequest):
                 "reply": "The query ran successfully but returned no results. The data matching your question may not exist in the database.",
                 "type": "empty",
                 "sql": safe_sql,
-                "params": list(params)
+                "params": list(params),
+                "title": new_title      # ← add this
             }
 
         return {
             "reply": result,
             "type": "table",
             "sql": safe_sql,
-            "params": list(params)
+            "params": list(params),
+            "title": new_title          # ← add this
         }
 
     except SQLValidationError as e:

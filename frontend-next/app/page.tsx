@@ -336,6 +336,16 @@ export default function Home() {
         params: data.params,
       }])
 
+      // If the backend generated a title for this conversation (first message),
+      // update the sidebar immediately without waiting for loadConversations()
+      if (data.title) {
+        setConversations(prev => prev.map(c =>
+          c.conversation_id === conversationId
+            ? { ...c, title: data.title, message_count: (c.message_count || 0) + 2 }
+            : c
+        ))
+      }
+
       loadConversations()
     } catch (err) {
       setMessages(prev => [...prev, {
@@ -346,6 +356,7 @@ export default function Home() {
       }])
     } finally {
       setLoading(false)
+      inputRef.current?.focus()
       inputRef.current?.focus()
     }
   }
