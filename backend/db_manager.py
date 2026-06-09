@@ -57,6 +57,21 @@ class DatabaseManager:
         try:
             conn = psycopg2.connect(**self.storage_db.get_connection_string())
             cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Check if the databases table exists first — it won't on fresh setups
+            cursor.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM information_schema.tables 
+                    WHERE table_name = 'databases' AND table_schema = 'public'
+                )
+            """)
+            if not cursor.fetchone()[0]:
+                # Table doesn't exist — this is normal for fresh setups
+                cursor.close()
+                conn.close()
+                self._cache = {}
+                return
+            
             cursor.execute(
                 "SELECT name, host, port, dbname, username, password, schema_name, description FROM databases WHERE enabled = true"
             )
@@ -78,9 +93,10 @@ class DatabaseManager:
                 )
                 self._cache[row["name"]] = config
             
-            print(f"✅ Loaded {len(self._cache)} databases from storage")
+            if self._cache:
+                print(f"✅ Loaded {len(self._cache)} databases from storage")
         except Exception as e:
-            print(f"❌ Error loading databases: {e}")
+            print(f"⚠️  Could not load databases table (this is fine for fresh setups): {e}")
             self._cache = {}
 
     def get_database(self, name: str) -> Optional[DatabaseConfig]:
@@ -176,14 +192,58 @@ class DatabaseManager:
             return False
 
 
+# ==============================================================================
+# DATABASE CONFIG LOADERS
+# ==============================================================================
+# Two databases, two purposes, two functions.
+# Each reads from its own set of .env variables.
+#
+#   get_target_db_config()   →  TARGET_DB_*   →  the database users query (READ ONLY)
+#   get_storage_db_config()  →  STORAGE_DB_*  →  where chat history is saved (READ + WRITE)
+# ==============================================================================
+
+
+def get_target_db_config() -> DatabaseConfig:
+    """
+    The database users ask questions about. READ ONLY.
+    
+    The app will:
+      - Inspect this database's schema at startup
+      - Run SELECT queries against it
+      - NEVER write to it (no INSERT, UPDATE, DELETE)
+    
+    .env variables: TARGET_DB_HOST, TARGET_DB_PORT, TARGET_DB_NAME,
+                    TARGET_DB_USER, TARGET_DB_PASSWORD, TARGET_DB_SCHEMA
+    """
+    db_name = os.getenv("TARGET_DB_NAME", "postgres")
+    return DatabaseConfig(
+        name=db_name,
+        host=os.getenv("TARGET_DB_HOST", "localhost"),
+        port=int(os.getenv("TARGET_DB_PORT", "5432")),
+        dbname=db_name,
+        username=os.getenv("TARGET_DB_USER", "postgres"),
+        password=os.getenv("TARGET_DB_PASSWORD", ""),
+        schema_name=os.getenv("TARGET_DB_SCHEMA", "public"),
+        description="Target database (read-only queries)"
+    )
+
+
 def get_storage_db_config() -> DatabaseConfig:
-    """Get the storage database config from environment."""
+    """
+    Where conversations and messages are saved. READ + WRITE.
+    
+    Requires 'conversations' and 'messages' tables to exist.
+    Run migrations/setup.sql before first use.
+    
+    .env variables: STORAGE_DB_HOST, STORAGE_DB_PORT, STORAGE_DB_NAME,
+                    STORAGE_DB_USER, STORAGE_DB_PASSWORD, STORAGE_DB_SCHEMA
+    """
     return DatabaseConfig(
         name="storage",
-        host=os.getenv("STORAGE_DB_HOST", os.getenv("DB_HOST", "localhost")),
-        port=int(os.getenv("STORAGE_DB_PORT", os.getenv("DB_PORT", "5432"))),
-        dbname=os.getenv("STORAGE_DB_NAME", os.getenv("DB_NAME", "northwind")),
-        username=os.getenv("STORAGE_DB_USER", os.getenv("DB_USER", "postgres")),
-        password=os.getenv("STORAGE_DB_PASSWORD", os.getenv("DB_PASSWORD", "")),
-        schema_name=os.getenv("STORAGE_DB_SCHEMA", os.getenv("DB_SCHEMA", "public"))
+        host=os.getenv("STORAGE_DB_HOST", "localhost"),
+        port=int(os.getenv("STORAGE_DB_PORT", "5432")),
+        dbname=os.getenv("STORAGE_DB_NAME", "datachat_storage"),
+        username=os.getenv("STORAGE_DB_USER", "postgres"),
+        password=os.getenv("STORAGE_DB_PASSWORD", ""),
+        schema_name=os.getenv("STORAGE_DB_SCHEMA", "public")
     )

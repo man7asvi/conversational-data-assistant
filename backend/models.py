@@ -59,13 +59,17 @@ class ConversationState:
         # Update context hints if SQL was generated
         if sql_generated:
             self.last_sql_generated = sql_generated
-            # Simple extraction: find table names in FROM/JOIN clauses
-            # (This is a naive implementation; enhance as needed)
-            sql_upper = sql_generated.upper()
-            for table in ["customers", "orders", "order_details", "products", "employees", "categories", "suppliers", "shippers"]:
-                if table.upper() in sql_upper:
-                    if table not in self.tables_used:
-                        self.tables_used.append(table)
+            # Extract table names from FROM/JOIN clauses dynamically
+            # Works for any database, not just specific tables
+            import re
+            from_matches = re.findall(
+                r'\b(?:from|join)\s+([a-zA-Z_][a-zA-Z0-9_]*)', 
+                sql_generated, re.IGNORECASE
+            )
+            for table in from_matches:
+                table_lower = table.lower()
+                if table_lower not in self.tables_used:
+                    self.tables_used.append(table_lower)
 
     def get_last_n_messages(self, n: int = 4) -> List[MessageRecord]:
         """Get the last n messages for context."""

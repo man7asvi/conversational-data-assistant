@@ -1,4 +1,23 @@
 # backend/llm_service.py
+"""
+LLM Service — generates SQL queries from natural language using Groq.
+
+KEY CHANGE FROM THE HARDCODED VERSION:
+Previously, the system prompt was a giant string literal with the Northwind
+schema baked in. Now it's built dynamically by build_system_prompt(), which
+takes the schema string from SchemaInspector.
+
+The prompt still has the same structure:
+  1. Role definition
+  2. Schema (now dynamic)
+  3. Rules (generic — not database-specific)
+  4. Response format
+  5. Few-shot examples (generic patterns, not Northwind-specific)
+
+The model sees the same format. It doesn't know or care that the schema
+was generated from information_schema rather than typed by hand.
+"""
+
 import json
 import os
 import re
@@ -9,129 +28,147 @@ load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-# ─── System prompt ────────────────────────────────────────────────────────────
-#
-# This is sent as the very first [system] message on EVERY call.
-# Think of it as the LLM's "job description + rulebook + reference manual."
-#
-# Key design decisions:
-#   1. Schema comes first — the model needs to see table/column names before
-#      it sees any examples or the user's question.
-#   2. Rules are explicit and numbered — LLMs follow numbered lists more
-#      reliably than prose paragraphs.
-#   3. Examples are in the exact JSON format we expect back — this is called
-#      "few-shot prompting." Each example is a mini-demonstration.
-#   4. The GROUP BY rule is called out explicitly because it's the single most
-#      common SQL mistake small models make.
-#
-# 📖 Read more on system prompts:
-#    https://docs.anthropic.com/en/docs/build-with-claude/prompt-engineering/overview
-#    (sections: "System prompts", "Be specific", "Use examples")
 
-SYSTEM_PROMPT = """You are a expert PostgreSQL query generator for the Northwind database.
+# ─── Dynamic system prompt builder ───────────────────────────────────────────
+#
+# This replaces the old hardcoded SYSTEM_PROMPT.
+#
+# WHY A FUNCTION INSTEAD OF A STRING?
+# Because the schema changes depending on which database is connected.
+# The rules stay the same, but the schema block is injected at runtime.
+#
+# The function is called ONCE at app startup (in main.py) and the result
+# is cached. It's not called on every request — that would be wasteful.
+#
+# The few-shot examples are deliberately generic. They show the JSON format
+# and demonstrate common SQL patterns (aggregation, filtering, joins, GROUP BY)
+# without referencing specific table or column names. The model learns the
+# PATTERN from examples and applies it to whatever schema it sees.
+#
+# 📖 Read: "Schema-aware prompting" is a technique used by tools like
+#    Defog, SQLCoder, and Vanna.ai. The key insight is that the schema IS
+#    the main context — examples are secondary.
+#    https://defog.ai/blog/open-sourcing-sqlcoder/
+
+def build_system_prompt(schema_str: str, table_names: list) -> str:
+    """
+    Build the system prompt dynamically from an introspected schema.
+
+    Args:
+        schema_str:   The prompt-ready schema string from SchemaInspector.
+                      e.g. "customers: customer_id (varchar PK), company_name (varchar)..."
+        table_names:  List of all table names (used in the out-of-scope message).
+
+    Returns:
+        Complete system prompt string ready to send to the LLM.
+    """
+    # Format table names for the out-of-scope message
+    tables_list = ", ".join(table_names)
+
+    return f"""You are an expert PostgreSQL query generator.
+You have access to a database with the schema described below.
 You MUST return ONLY a valid JSON object. No explanation. No markdown. No prose.
 
 === DATABASE SCHEMA ===
 
-customers:        customer_id (varchar PK), company_name, contact_name, contact_title, city, country
-orders:           order_id (int PK), customer_id (FK), employee_id (FK), order_date, shipped_date, ship_city, ship_country, freight
-order_details:    order_id (FK), product_id (FK), unit_price, quantity (smallint), discount (real)
-products:         product_id (int PK), product_name, supplier_id (FK), category_id (FK), unit_price, units_in_stock (smallint), discontinued (smallint: 0=active 1=discontinued)
-employees:        employee_id (int PK), first_name, last_name, title, city, country
-categories:       category_id (int PK), category_name, description
-suppliers:        supplier_id (int PK), company_name, city, country
-shippers:         shipper_id (int PK), company_name
+{schema_str}
 
 === RULES ===
 
 1. Only generate SELECT queries. Never INSERT, UPDATE, DELETE, DROP, ALTER.
 2. Use %s placeholders for ALL literal values in WHERE clauses. Put those values in params[].
 3. GROUP BY must include every non-aggregated column in SELECT — this is a hard PostgreSQL rule.
-4. For revenue use: SUM(od.unit_price * od.quantity * (1 - od.discount))
-5. Always ROUND revenue/averages: ROUND(value::numeric, 2)
-6. Always alias computed columns (e.g. COUNT(*) as total_orders)
-7. Use table aliases (c, o, od, p, e) consistently.
-8. Default to LIMIT 20 unless the user asks for a specific number.
-9. When the user refers to "them", "their", "those", "that customer" etc., use values
-   from the PREVIOUS RESULTS provided in context — put them as params in an IN (%s, %s, ...) clause.
-10. The discontinued column is a smallint (0 or 1), NEVER compare it to true/false/boolean.
-    Always use: discontinued = 0 (active) or discontinued = 1 (discontinued).
-11. NEVER add filters the user did not explicitly ask for. If the user asks for "products
-    that have never been ordered", do not add WHERE discontinued = 0 unless they said so.
-    Only filter on what the user actually asked.
-12. If the user's question cannot be answered from the Northwind database — for example
-    questions about weather, news, people outside the dataset, or general knowledge —
-    do NOT generate a SQL query. Instead return this exact JSON:
-    {"sql": null, "params": [], "out_of_scope": true, "message": "I can only answer questions about the Northwind database (customers, orders, products, employees, suppliers)."}
-
+4. Always ROUND computed numeric values: ROUND(value::numeric, 2)
+5. Always alias computed columns (e.g. COUNT(*) as total_count, SUM(x) as total_x).
+6. Use short table aliases (first letter or abbreviation) consistently.
+7. Default to LIMIT 20 unless the user asks for a specific number.
+8. When the user refers to "them", "their", "those" etc., use values from the
+   PREVIOUS RESULTS provided in context — put them as params in an IN (%s, %s, ...) clause.
+9. NEVER add filters the user did not explicitly ask for. Only filter on what was actually asked.
+10. Boolean-like columns stored as smallint (0/1) should be compared to 0 or 1, never true/false.
+11. If the user's question cannot be answered from the available database — for example
+    questions about weather, news, celebrities, or general knowledge — do NOT generate SQL.
+    Instead return: {{"sql": null, "params": [], "out_of_scope": true, "message": "I can only answer questions about the data in this database ({tables_list})."}}
+12. Study the schema carefully. Use the correct column names, data types, and foreign key
+    relationships shown above. Do not guess column names that are not in the schema.
+13. For monetary/revenue calculations, look for columns with price, amount, cost, or value
+    in their names. If there's a quantity and unit_price, revenue = SUM(unit_price * quantity).
+14. For vague exploration questions like "show me something interesting", "what insights can
+    you give me", or "how is business doing" — generate a useful summary query based on the
+    schema. Pick the most meaningful aggregation you can find (revenue, counts, averages).
+    These are valid data questions, NOT out-of-scope.
 
 === RESPONSE FORMAT ===
 
-{"sql": "SELECT ...", "params": []}
+{{"sql": "SELECT ...", "params": []}}
 
 === EXAMPLES ===
 
-User: show top 5 customers by revenue
-{"sql": "SELECT c.company_name, ROUND(SUM(od.unit_price * od.quantity * (1 - od.discount))::numeric, 2) as revenue FROM customers c JOIN orders o ON c.customer_id = o.customer_id JOIN order_details od ON o.order_id = od.order_id GROUP BY c.company_name ORDER BY revenue DESC LIMIT 5", "params": []}
+These examples show the expected JSON format and common SQL patterns.
+Apply these patterns to whatever tables exist in the schema above.
 
-User: which products are low in stock
-{"sql": "SELECT product_name, units_in_stock, unit_price FROM products WHERE units_in_stock < %s AND discontinued = 0 ORDER BY units_in_stock ASC LIMIT 20", "params": [10]}
+User: show all records from the first table
+{{"sql": "SELECT * FROM <table_name> LIMIT 20", "params": []}}
 
-User: show me discontinued products
-{"sql": "SELECT product_name, unit_price, units_in_stock FROM products WHERE discontinued = 1 ORDER BY product_name LIMIT 20", "params": []}
+User: how many records are in [table]
+{{"sql": "SELECT COUNT(*) as total_count FROM <table_name>", "params": []}}
 
-User: revenue by country
-{"sql": "SELECT o.ship_country, ROUND(SUM(od.unit_price * od.quantity * (1 - od.discount))::numeric, 2) as revenue FROM orders o JOIN order_details od ON o.order_id = od.order_id GROUP BY o.ship_country ORDER BY revenue DESC LIMIT 20", "params": []}
+User: show the top 5 [items] by [metric]
+{{"sql": "SELECT name_col, SUM(value_col) as total FROM table1 t1 JOIN table2 t2 ON t1.id = t2.fk_id GROUP BY name_col ORDER BY total DESC LIMIT 5", "params": []}}
 
-User: show me all orders from QUICK-Stop
-{"sql": "SELECT o.order_id, o.order_date, o.shipped_date, o.freight, o.ship_country FROM orders o WHERE o.customer_id = %s ORDER BY o.order_date DESC LIMIT 20", "params": ["QUICK"]}
+User: show [items] where [column] = [value]
+{{"sql": "SELECT col1, col2 FROM table WHERE col = %s LIMIT 20", "params": ["value"]}}
 
-User: what products did Ernst Handel order
-{"sql": "SELECT DISTINCT p.product_name, p.unit_price, cat.category_name FROM products p JOIN order_details od ON p.product_id = od.product_id JOIN orders o ON od.order_id = o.order_id JOIN categories cat ON p.category_id = cat.category_id WHERE o.customer_id = %s ORDER BY p.product_name LIMIT 20", "params": ["ERNSH"]}
+User: which [items] have never been [linked to another table]
+{{"sql": "SELECT t1.col1, t1.col2 FROM table1 t1 LEFT JOIN table2 t2 ON t1.id = t2.fk_id WHERE t2.fk_id IS NULL LIMIT 20", "params": []}}
 
-User: show employees and how many orders they handled
-{"sql": "SELECT e.first_name || ' ' || e.last_name as employee_name, e.title, COUNT(o.order_id) as total_orders FROM employees e LEFT JOIN orders o ON e.employee_id = o.employee_id GROUP BY e.employee_id, e.first_name, e.last_name, e.title ORDER BY total_orders DESC", "params": []}
+User: compare [A] and [B]
+{{"sql": "SELECT group_col, SUM(value_col) as total FROM table WHERE group_col IN (%s, %s) GROUP BY group_col ORDER BY total DESC", "params": ["A", "B"]}}
 
 User: what is the weather today
-{"sql": null, "params": [], "out_of_scope": true, "message": "I can only answer questions about the Northwind database (customers, orders, products, employees, suppliers)."}
-
-User: who is the CEO of Apple
-{"sql": null, "params": [], "out_of_scope": true, "message": "I can only answer questions about the Northwind database (customers, orders, products, employees, suppliers)."}
+{{"sql": null, "params": [], "out_of_scope": true, "message": "I can only answer questions about the data in this database ({tables_list})."}}
 """
+
+
+# ─── Module-level prompt cache ────────────────────────────────────────────────
+# Initialized once by main.py at startup via init_prompt()
+_system_prompt: str = ""
+_table_names: list = []
+
+
+def init_prompt(schema_str: str, table_names: list):
+    """
+    Called once at app startup (from main.py) to set the system prompt.
+    
+    This caches the prompt so it's not rebuilt on every request.
+    Think of it as the LLM's "job description" being written once
+    and posted on the wall — everyone reads the same one.
+    """
+    global _system_prompt, _table_names
+    _system_prompt = build_system_prompt(schema_str, table_names)
+    _table_names = table_names
+    print(f"✅ System prompt built: {len(_system_prompt)} chars, {len(table_names)} tables")
+
+
+def get_system_prompt() -> str:
+    """Get the cached system prompt."""
+    if not _system_prompt:
+        raise RuntimeError(
+            "System prompt not initialized. Call init_prompt() at startup. "
+            "This usually means SchemaInspector didn't run."
+        )
+    return _system_prompt
 
 
 # ─── Context builder ──────────────────────────────────────────────────────────
 #
-# This is the key fix. Instead of dumping raw message blobs, we build a clean
-# structured summary of what happened in the conversation so far.
-#
-# The two things the LLM needs from prior turns:
-#   1. What the user actually asked (plain English)
-#   2. What SQL was generated — NOT the results, just the SQL
-#
-# For follow-up queries like "show me their orders", we also need to inject
-# the actual KEY VALUES from the previous result (e.g. customer IDs).
-# That way the model can write: WHERE customer_id IN (%s, %s) with real params.
-#
-# Why not send the full result? Two reasons:
-#   - A 50-row result is ~2000 tokens. At 4 turns that's 8000 tokens of noise.
-#   - The model doesn't need the data, it needs the identifiers (IDs / names).
-#
-# 📖 Read: "Context window management" and "Conversation history"
-#    https://platform.openai.com/docs/guides/conversation-state
-#    Also a great practical post on prompt context design:
-#    https://www.promptingguide.ai/techniques/fewshot
+# Unchanged from the previous version. This is database-agnostic — it doesn't
+# care what tables exist, it just formats conversation history cleanly.
 
 def _extract_key_values(result_json_str: str, max_values: int = 10) -> list:
     """
     Pull out the most likely 'identifier' values from a stored result blob.
-    We use these to help the model write IN (...) clauses on follow-up queries.
-
-    For example, if the last result was:
-      [{"customer_id": "QUICK", "company_name": "QUICK-Stop"}, ...]
-    We return: ["QUICK", "ERNSH", ...]
-
-    We prefer columns named *_id or the first column if no ID column exists.
+    Prefers columns named *_id, falls back to first column.
     """
     try:
         data = json.loads(result_json_str)
@@ -141,9 +178,7 @@ def _extract_key_values(result_json_str: str, max_values: int = 10) -> list:
         first_row = data[0]
         keys = list(first_row.keys())
 
-        # Prefer explicit ID columns
         id_col = next((k for k in keys if k.endswith("_id")), None)
-        # Fall back to first column
         target_col = id_col or keys[0]
 
         values = [row[target_col] for row in data[:max_values] if target_col in row]
@@ -155,25 +190,11 @@ def _extract_key_values(result_json_str: str, max_values: int = 10) -> list:
 def _build_conversation_history(conversation_state) -> list:
     """
     Convert stored conversation messages into clean LLM message format.
-
-    Returns a list of {"role": ..., "content": ...} dicts.
-
-    The pattern we produce for each prior turn:
-      [user]      "show top 5 customers by revenue"
-      [assistant] '{"sql": "SELECT c.company_name...", "params": []}'
-
-    This teaches the model through example: user speaks English,
-    assistant responds with SQL JSON. Clean, consistent, unambiguous.
-
-    We also append a CONTEXT note to the last user message if the previous
-    result had extractable key values — this helps with "show me their orders"
-    style follow-up questions.
+    Returns user/assistant pairs with SQL JSON (not result blobs).
     """
     if not conversation_state or not conversation_state.messages:
         return []
 
-    # Take the last 3 full turns (6 messages: 3 user + 3 assistant)
-    # Going further back gives diminishing returns and adds token cost.
     recent = conversation_state.get_last_n_messages(6)
 
     history = []
@@ -183,31 +204,22 @@ def _build_conversation_history(conversation_state) -> list:
         if msg.role == "user":
             content = msg.content
 
-            # If we have key values from the previous assistant turn,
-            # append them as a hint so the model can resolve "them"/"their"
             if previous_result_values:
                 values_str = ", ".join(str(v) for v in previous_result_values)
                 content += f"\n[CONTEXT: Previous result contained these values: {values_str}]"
-                previous_result_values = []  # consume — only relevant for next turn
+                previous_result_values = []
 
             history.append({"role": "user", "content": content})
 
         elif msg.role == "assistant":
-            # Only send the SQL back, not the result blob.
-            # The model needs to see what SQL pattern it generated,
-            # so it can build on it (e.g. same tables, same aliases).
             if msg.sql_generated:
                 history.append({
                     "role": "assistant",
                     "content": json.dumps({"sql": msg.sql_generated, "params": msg.params_used or []})
                 })
-
-                # Try to extract key values from the result for the NEXT turn's context hint
                 previous_result_values = _extract_key_values(msg.content)
             else:
-                # Error turn — skip it entirely. We don't want the model to
-                # "learn" from failed queries.
-                pass
+                pass  # Skip error turns
 
     return history
 
@@ -217,29 +229,19 @@ def _build_conversation_history(conversation_state) -> list:
 def extract_sql_query(user_text: str, conversation_state=None):
     """
     Generate a SQL query from the user's plain-English question.
-
-    Message structure sent to the LLM:
-      [system]       SYSTEM_PROMPT (schema + rules + examples)
-      [user]         prior turn 1 question
-      [assistant]    prior turn 1 SQL JSON
-      [user]         prior turn 2 question  ← may include [CONTEXT: ...] hint
-      [assistant]    prior turn 2 SQL JSON
-      ...
-      [user]         current question
-
-    This is a standard "multi-turn prompting" pattern. The model sees the
-    full back-and-forth and generates the next assistant turn.
+    Uses the cached system prompt (which contains the dynamic schema).
     """
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    system_prompt = get_system_prompt()
+    messages = [{"role": "system", "content": system_prompt}]
 
-    # Inject cleaned conversation history (user questions + SQL only)
+    # Inject cleaned conversation history
     history = _build_conversation_history(conversation_state)
     messages.extend(history)
 
-    # Current user question is the final message
+    # Current user question
     messages.append({"role": "user", "content": user_text})
 
-    # ── Debug logging ──────────────────────────────────────────────────────
+    # Debug logging
     print(f"\n{'='*60}")
     print(f"📤 SENDING TO LLM — {len(messages)} messages")
     for m in messages:
@@ -250,14 +252,14 @@ def extract_sql_query(user_text: str, conversation_state=None):
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=messages,
-        temperature=0,       # 0 = deterministic, no creativity. We want exact SQL.
-        max_tokens=512,      # SQL rarely needs more than this. Caps runaway responses.
+        temperature=0,
+        max_tokens=512,
     )
 
     raw_output = response.choices[0].message.content.strip()
     print(f"🤖 LLM output: {raw_output}")
 
-    # Strip markdown fences if the model wraps the JSON anyway
+    # Strip markdown fences
     if raw_output.startswith("```"):
         raw_output = re.sub(r"^```[a-z]*\n?", "", raw_output)
         raw_output = re.sub(r"\n?```$", "", raw_output)
@@ -265,67 +267,28 @@ def extract_sql_query(user_text: str, conversation_state=None):
 
     try:
         result = json.loads(raw_output)
-        # Normalise — ensure both keys exist
         result.setdefault("params", [])
         result.setdefault("sql", "")
         return result
     except json.JSONDecodeError:
         print(f"❌ JSON parse failed: {raw_output}")
-        # Return None sql so main.py can return a clean "I didn't understand" message
         return {"sql": None, "params": [], "parse_error": raw_output}
 
 
 # ─── Retry: fix broken SQL ────────────────────────────────────────────────────
-#
-# Called by main.py when PostgreSQL rejects the generated SQL.
-# We send the model its own bad SQL + the exact Postgres error and ask it
-# to return a corrected JSON object.
-#
-# Why a separate function and not just a loop inside extract_sql_query?
-# Because the caller (main.py) is the one who knows the DB error — it only
-# exists after actually running the query. The LLM call and DB call live in
-# different layers, so the fix has to cross that boundary explicitly.
-#
-# The message structure for the retry call:
-#   [system]    SYSTEM_PROMPT  (same rules, same schema)
-#   [user]      original user question
-#   [assistant] the bad SQL JSON the model generated
-#   [user]      "That SQL failed: <postgres error>. Fix it."
-#
-# This is called "error-driven self-correction" — a standard pattern for
-# agentic LLM systems. The model acts as its own debugger.
-#
-# 📖 Read: "Self-refine" prompting paper (Madaan et al. 2023)
-#    https://arxiv.org/abs/2303.17651
-#    Also: "ReAct" pattern for LLM tool use + error recovery
-#    https://arxiv.org/abs/2210.03629
 
 def fix_sql_with_error(user_text: str, bad_sql: str, bad_params: list, db_error: str) -> dict:
     """
     Ask the LLM to fix a SQL query that PostgreSQL rejected.
-
-    Args:
-        user_text:  The original user question (so the model remembers the intent)
-        bad_sql:    The SQL that failed
-        bad_params: The params that were used
-        db_error:   The raw PostgreSQL error string
-
-    Returns:
-        Same shape as extract_sql_query: {"sql": ..., "params": [...]}
-        Returns {"sql": None} if the retry also fails to parse.
+    Uses the same system prompt so the model has the schema context.
     """
-    # Clean the postgres error — strip the trailing newline + caret line
-    # e.g. "operator does not exist: integer = boolean\nLINE 1: ...^\n"
-    # becomes "operator does not exist: integer = boolean LINE 1: ..."
+    system_prompt = get_system_prompt()
     clean_error = " ".join(db_error.strip().splitlines())
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        # Show the original question so the model knows what it was trying to do
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_text},
-        # Show the bad SQL it generated
         {"role": "assistant", "content": json.dumps({"sql": bad_sql, "params": bad_params})},
-        # Tell it exactly what went wrong and ask for a fix
         {
             "role": "user",
             "content": (
@@ -353,7 +316,6 @@ def fix_sql_with_error(user_text: str, bad_sql: str, bad_params: list, db_error:
         raw_output = response.choices[0].message.content.strip()
         print(f"🔄 Retry LLM output: {raw_output}")
 
-        # Strip markdown fences
         if raw_output.startswith("```"):
             raw_output = re.sub(r"^```[a-z]*\n?", "", raw_output)
             raw_output = re.sub(r"\n?```$", "", raw_output)

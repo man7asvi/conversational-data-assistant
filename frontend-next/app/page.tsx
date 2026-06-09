@@ -164,6 +164,7 @@ export default function Home() {
   const [conversations, setConversations] = useState<Conversation[]>([])
   const [convsLoading, setConvsLoading] = useState(true)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [dbName, setDbName] = useState('Database')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   // If user types and hits Send before the conversation ID is ready,
@@ -173,6 +174,17 @@ export default function Home() {
   useEffect(() => {
     initializeConversation()
     loadConversations()
+    // Fetch database name from backend
+    fetch('/api/health')
+      .then(r => r.json())
+      .then(data => {
+        if (data.allowed_tables) {
+          // Use the database name from the health endpoint
+          const name = data.database_name || 'Database'
+          setDbName(name.charAt(0).toUpperCase() + name.slice(1))
+        }
+      })
+      .catch(() => {})
   }, [])
 
   useEffect(() => {
@@ -980,7 +992,7 @@ export default function Home() {
             <div className="db-label">Database</div>
             <div className="db-badge">
               <span className="db-dot" />
-              northwind
+              {dbName.toLowerCase()}
             </div>
           </div>
 
@@ -1024,7 +1036,7 @@ export default function Home() {
             <div className="topbar-title">
               {activeConv?.title ?? (conversationLoading ? 'Initializing…' : 'Conversational Data Assistant')}
             </div>
-            <span className="topbar-sub">Northwind DB</span>
+            <span className="topbar-sub">{dbName} DB</span>
           </div>
 
           {/* Error banner */}
@@ -1036,7 +1048,7 @@ export default function Home() {
               <div className="empty-state">
                 <div className="hero-icon">🔍</div>
                 <h2>Ask about your data</h2>
-                <p>Query the Northwind database in plain English. Try one of these:</p>
+                <p>Query your database in plain English. Try one of these:</p>
                 <div className="suggestions">
                   {SUGGESTIONS.map(s => (
                     <button

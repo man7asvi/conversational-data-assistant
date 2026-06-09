@@ -57,7 +57,7 @@ class PostgresSessionStore(SessionStore):
         except Exception as e:
             print(f"⚠️  Warning: Could not verify tables: {e}")
 
-    def create_conversation(self, title: str, database_name: str = "northwind") -> ConversationState:
+    def create_conversation(self, title: str, database_name: str = "default") -> ConversationState:
         """
         Create a new conversation.
         

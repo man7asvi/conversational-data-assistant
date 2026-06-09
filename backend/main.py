@@ -22,22 +22,48 @@ except ImportError:
     validate_sql = None
     SQLValidationError = None
 
-from llm_service import extract_sql_query, fix_sql_with_error, generate_conversation_title
+from llm_service import extract_sql_query, fix_sql_with_error, generate_conversation_title, init_prompt
 from models import ConversationState
-from db_manager import DatabaseManager, get_storage_db_config
+from db_manager import DatabaseManager, get_storage_db_config, get_target_db_config
 from postgres_session_store import PostgresSessionStore
+from schema_inspector import SchemaInspector
 
 # ============================================================================
-# Initialize FastAPI and Session Store
+# Initialize — Two databases, two purposes
+# ============================================================================
+#
+#   STORAGE DB  →  configured via STORAGE_DB_* in .env
+#                  where conversations and messages are saved (READ + WRITE)
+#
+#   TARGET DB   →  configured via TARGET_DB_* in .env
+#                  the database users ask questions about (READ ONLY)
+#
+# The app NEVER writes to the target database.
+# The app NEVER reads user data from the storage database.
 # ============================================================================
 app = FastAPI()
 
-# Initialize the PostgreSQL session store for conversation persistence
+# ── Storage DB: chat history ──
 storage_db_config = get_storage_db_config()
 session_store = PostgresSessionStore(storage_db_config)
+print(f"✅ Storage DB: {storage_db_config.dbname} @ {storage_db_config.host}")
 
-# Initialize database manager for multi-database support
+# ── Target DB: user data (read-only) ──
+target_db_config = get_target_db_config()
+DEFAULT_DATABASE = target_db_config.name
+
+# Register target DB in the manager so query_db() can find it
 db_manager = DatabaseManager(storage_db_config)
+db_manager._cache[target_db_config.name] = target_db_config
+print(f"✅ Target DB: {target_db_config.dbname} @ {target_db_config.host}")
+
+# ── Schema Introspection ──
+# Discover tables, columns, types, and relationships from the TARGET database.
+# This builds the LLM prompt dynamically — no hardcoded schema needed.
+schema_inspector = SchemaInspector(target_db_config)
+_schema = schema_inspector.inspect()
+init_prompt(_schema["prompt_schema"], _schema["table_names"])
+ALLOWED_TABLES = _schema["table_names"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -55,24 +81,75 @@ def health():
         "status": "ok",
         "session_store_type": type(session_store).__name__,
         "databases_loaded": len(db_manager.list_databases()),
+        "schema_tables": len(ALLOWED_TABLES),
+        "allowed_tables": ALLOWED_TABLES,
+        "database_name": DEFAULT_DATABASE,
+    }
+
+
+@app.get("/schema")
+def get_schema():
+    """
+    Return the discovered schema. Useful for:
+    - Verifying the inspector found the right tables
+    - Debugging when queries reference wrong column names
+    - Showing users what tables are available
+    """
+    schema = schema_inspector.inspect()
+    return {
+        "table_count": schema["table_count"],
+        "column_count": schema["column_count"],
+        "tables": {
+            name: {
+                "columns": [
+                    {
+                        "name": col.name,
+                        "type": col.data_type,
+                        "primary_key": col.is_primary_key,
+                        "foreign_key": col.foreign_key,
+                    }
+                    for col in table.columns
+                ]
+            }
+            for name, table in schema["tables"].items()
+        }
+    }
+
+
+@app.post("/schema/refresh")
+def refresh_schema():
+    """
+    Force re-inspection of the database schema.
+    Call this after adding/removing tables without restarting the server.
+    """
+    global ALLOWED_TABLES
+    schema_inspector.refresh()
+    schema = schema_inspector.inspect()
+    init_prompt(schema["prompt_schema"], schema["table_names"])
+    ALLOWED_TABLES = schema["table_names"]
+    return {
+        "status": "refreshed",
+        "table_count": schema["table_count"],
+        "tables": schema["table_names"],
     }
 
 # Request models
 class ChatRequest(BaseModel):
     conversation_id: str  # UUID as string
     text: str
-    database_name: Optional[str] = "northwind"  # Default to northwind
+    database_name: Optional[str] = None  # Uses DEFAULT_DATABASE if not specified
 
 class CreateConversationRequest(BaseModel):
     title: str = "New Conversation"
-    database_name: str = "northwind"
+    database_name: str = ""  # Will use DEFAULT_DATABASE
 
 
-def query_db(query: str, params: tuple = (), database_name: str = "northwind"):
+def query_db(query: str, params: tuple = (), database_name: str = ""):
     """Execute query against a specific database."""
-    db_config = db_manager.get_database(database_name)
+    db_name = database_name or DEFAULT_DATABASE
+    db_config = db_manager.get_database(db_name)
     if not db_config:
-        raise ValueError(f"Database '{database_name}' not found")
+        raise ValueError(f"Database '{db_name}' not found")
     
     conn = psycopg2.connect(**db_config.get_connection_string())
     cursor = conn.cursor(cursor_factory=RealDictCursor)
@@ -110,14 +187,15 @@ def test_database_connection(name: str):
 @app.post("/conversations")
 def create_conversation(request: CreateConversationRequest):
     """Create a new conversation."""
+    db_name = request.database_name or DEFAULT_DATABASE
     state = session_store.create_conversation(
         request.title, 
-        request.database_name
+        db_name
     )
     return {
         "conversation_id": str(state.conversation_id),
         "title": state.title,
-        "database_name": request.database_name,
+        "database_name": db_name,
         "created_at": state.created_at.isoformat(),
     }
 
@@ -126,7 +204,6 @@ def create_conversation(request: CreateConversationRequest):
 def list_conversations(database_name: Optional[str] = None):
     """List all conversations, optionally filtered by database."""
     try:
-        storage_db_config = get_storage_db_config()
         conn = psycopg2.connect(**storage_db_config.get_connection_string())
         cursor = conn.cursor(cursor_factory=RealDictCursor)
         
@@ -218,7 +295,7 @@ def chat(request: ChatRequest):
         raise HTTPException(status_code=400, detail="Invalid conversation_id format")
     
     text = request.text.strip()
-    database_name = request.database_name or "northwind"
+    database_name = request.database_name or DEFAULT_DATABASE
     
     # Retrieve conversation state
     state = session_store.get_conversation(conversation_id)
@@ -250,9 +327,10 @@ def chat(request: ChatRequest):
         if not sql:
             # Check if the model explicitly flagged this as out of scope
             if llm_output.get("out_of_scope"):
+                tables_str = ", ".join(ALLOWED_TABLES)
                 reply = llm_output.get(
                     "message",
-                    "I can only answer questions about the Northwind database (customers, orders, products, employees, suppliers)."
+                    f"I can only answer questions about the data in this database ({tables_str})."
                 )
             else:
                 # LLM returned bad JSON or couldn't understand the question
@@ -276,9 +354,7 @@ def chat(request: ChatRequest):
 
         safe_sql = validate_sql(
             sql,
-            allowed_tables=["customers", "orders", "order_details", "products", 
-                            "employees", "categories", "suppliers", "shippers",
-                            "territories", "region", "us_states"],
+            allowed_tables=ALLOWED_TABLES,
             require_limit=True
         )
 
@@ -302,10 +378,9 @@ def chat(request: ChatRequest):
             params_used=list(params)
         )
 
-         # ── Auto-title on first message ───────────────────────────────────
+        # ── Auto-title on first message ───────────────────────────────
         # state.messages was loaded BEFORE we saved this turn, so if it was
         # empty then this is the first ever message in the conversation.
-        # We generate a short title and update the DB immediately.
         new_title = None
         if len(state.messages) == 0:
             try:
@@ -316,15 +391,13 @@ def chat(request: ChatRequest):
                 print(f"⚠️  Title generation failed (non-fatal): {title_err}")
 
         # When the query ran fine but returned nothing, tell the user clearly.
-        # "type: empty" lets the frontend show the SQL (so the user can see what
-        # ran) alongside a human-readable explanation instead of just blank space.
         if not result:
             return {
                 "reply": "The query ran successfully but returned no results. The data matching your question may not exist in the database.",
                 "type": "empty",
                 "sql": safe_sql,
                 "params": list(params),
-                "title": new_title      # ← add this
+                "title": new_title
             }
 
         return {
@@ -332,7 +405,7 @@ def chat(request: ChatRequest):
             "type": "table",
             "sql": safe_sql,
             "params": list(params),
-            "title": new_title          # ← add this
+            "title": new_title
         }
 
     except SQLValidationError as e:
@@ -381,9 +454,7 @@ def chat(request: ChatRequest):
             # Validate the fixed SQL through the same security layer
             safe_retry_sql = validate_sql(
                 retry_sql,
-                allowed_tables=["customers", "orders", "order_details", "products",
-                                "employees", "categories", "suppliers", "shippers",
-                                "territories", "region", "us_states"],
+                allowed_tables=ALLOWED_TABLES,
                 require_limit=True
             )
 
