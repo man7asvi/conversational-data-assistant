@@ -1,0 +1,9 @@
+fastapi==0.136.1
+groq==1.1.2
+httpx==0.28.1
+psycopg2-binary==2.9.10
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+requests==2.34.2
+uvicorn==0.32.1
