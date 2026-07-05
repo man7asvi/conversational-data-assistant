@@ -30,6 +30,8 @@ The system connects to your PostgreSQL database, automatically discovers all tab
 
 **Query any PostgreSQL database** — Point it at your database via `.env`. The schema inspector discovers tables, columns, types, primary keys, and foreign keys automatically.
 
+**Multi-database support** — The backend can track and query more than one registered database, with endpoints to list them and test connectivity, in addition to the default target database configured via `.env`.
+
 **Conversational context** — Ask follow-up questions naturally. *"Show top customers"* → *"Show me their orders"* → *"Which products did they buy?"* — the system maintains context across turns.
 
 **Self-correcting SQL** — If a generated query fails, the system automatically sends the error back to the LLM for a second attempt. Most errors are silently fixed without you ever seeing them.
@@ -54,26 +56,20 @@ The system connects to your PostgreSQL database, automatically discovers all tab
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/datachat.git
-cd datachat
+git clone https://github.com/man7asvi/conversational-data-assistant.git
+cd conversational-data-assistant
 ```
 
 ### 2. Set up the backend
 
 ```bash
 cd backend
-pip install fastapi uvicorn psycopg2-binary groq python-dotenv
+pip install -r requirements.txt
 ```
 
 ### 3. Configure your databases
 
-Copy the example environment file and fill in your credentials:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your database details:
+Create a `.env` file in `backend/` (there is no `.env.example` checked into the repo, so create it from scratch) with your database details:
 
 ```env
 # The database you want to ask questions about (READ ONLY)
@@ -106,7 +102,7 @@ If using a separate storage database, create it first:
 createdb datachat_storage
 ```
 
-Then run the migration:
+Then run the migration (from inside `backend/`):
 
 ```bash
 psql -U your_user -d datachat_storage -f migrations/setup.sql
@@ -140,9 +136,22 @@ INFO:     Uvicorn running on http://127.0.0.1:8000
 
 ### 6. Start the frontend
 
+The active frontend is the Next.js app in `frontend-next/` (the older Vite app in `frontend/` is a legacy prototype and is no longer maintained).
+
 ```bash
-cd frontend
+cd frontend-next
 npm install
+```
+
+Create a `.env.local` file in `frontend-next/` pointing at your backend:
+
+```env
+NEXT_PUBLIC_API_URL=http://127.0.0.1:8000
+```
+
+Then start the dev server:
+
+```bash
 npm run dev
 ```
 
@@ -155,28 +164,33 @@ Go to [http://localhost:3000](http://localhost:3000) and start asking questions 
 ## Project Structure
 
 ```
-datachat/
+conversational-data-assistant/
 ├── backend/
 │   ├── main.py                    # FastAPI app, API endpoints, request handling
 │   ├── llm_service.py             # LLM integration, prompt building, SQL generation
 │   ├── schema_inspector.py        # Auto-discovers database schema from PostgreSQL
 │   ├── validator.py               # SQL validation, security checks, table whitelisting
-│   ├── db_manager.py              # Database config loading from .env
+│   ├── db_manager.py              # Multi-database config/registry, connection helpers
 │   ├── models.py                  # Data models (ConversationState, MessageRecord)
 │   ├── session_store.py           # Abstract storage interface
 │   ├── postgres_session_store.py  # PostgreSQL implementation of session storage
 │   ├── nlu.py                     # Basic NLU parser (legacy, not used in LLM flow)
-│   └── .env.example               # Template for database configuration
+│   ├── init_db.py                 # One-off helper for initializing storage tables
+│   ├── migrations/
+│   │   └── setup.sql              # Creates conversations & messages tables
+│   ├── config/                    # Misc backend config (e.g. DB SSL cert)
+│   ├── requirements.txt           # Backend Python dependencies
+│   └── railway.toml               # Railway deployment config
 │
-├── frontend/
+├── frontend-next/                 # Active frontend (Next.js) — use this one
 │   ├── app/
 │   │   ├── page.tsx               # Main chat UI
 │   │   └── api/[...slug]/
-│   │       └── route.ts           # Proxy: forwards frontend requests to backend
+│   │       └── route.ts           # Proxy: forwards frontend requests to the backend
 │   └── ...
 │
-└── migrations/
-    └── setup.sql                  # Creates conversations & messages tables
+└── frontend/                      # Legacy Vite + React prototype (unmaintained)
+    └── ...
 ```
 
 ---
@@ -211,7 +225,7 @@ datachat/
 
 1. User types a question in the browser
 2. Frontend sends `POST /api/chat` with the question and conversation ID
-3. `route.ts` proxies the request to `http://localhost:8000/chat`
+3. `route.ts` proxies the request to the backend at `NEXT_PUBLIC_API_URL` (defaults to `http://127.0.0.1:8000`)
 4. Backend loads conversation history from the storage database
 5. `llm_service.py` builds the prompt: system prompt (with schema) + conversation history + user question
 6. Groq API generates a SQL query as JSON
@@ -224,7 +238,7 @@ datachat/
 
 ## Configuration
 
-### Environment Variables
+### Backend environment variables (`backend/.env`)
 
 | Variable | Required | Description |
 |---|---|---|
@@ -241,6 +255,12 @@ datachat/
 | `STORAGE_DB_PASSWORD` | Yes | Storage database password |
 | `STORAGE_DB_SCHEMA` | No | Storage schema (default: `public`) |
 | `GROQ_API_KEY` | Yes | API key from [console.groq.com](https://console.groq.com) |
+
+### Frontend environment variables (`frontend-next/.env.local`)
+
+| Variable | Required | Description |
+|---|---|---|
+| `NEXT_PUBLIC_API_URL` | No | Base URL of the backend API (default: `http://127.0.0.1:8000`) |
 
 ### Schema Inspector
 
@@ -270,8 +290,10 @@ schema_inspector = SchemaInspector(db_config, exclude_tables=set())
 | `GET` | `/health` | Server status, connected database, discovered tables |
 | `GET` | `/schema` | Full discovered schema as JSON |
 | `POST` | `/schema/refresh` | Re-inspect database schema without restarting |
+| `GET` | `/databases` | List all registered databases |
+| `GET` | `/databases/{name}/test` | Test the connection to a registered database |
 | `POST` | `/conversations` | Create a new conversation |
-| `GET` | `/conversations` | List all conversations |
+| `GET` | `/conversations` | List all conversations (optionally filter by `database_name`) |
 | `GET` | `/conversations/:id` | Get a conversation with full message history |
 | `DELETE` | `/conversations/:id` | Delete a conversation |
 | `POST` | `/chat` | Send a message and get a response |
@@ -302,6 +324,16 @@ Then use `datachat_reader` as your `TARGET_DB_USER`.
 
 ---
 
+## Deployment
+
+The repo ships with config for a Railway (backend) + Vercel (frontend) deployment:
+
+- `backend/railway.toml` configures Railway to run `uvicorn main:app --host 0.0.0.0 --port $PORT` with a health check against `/health`.
+- `frontend-next/` deploys to Vercel as a standard Next.js app. Set `NEXT_PUBLIC_API_URL` in the Vercel project's environment variables to point at your deployed Railway backend URL.
+- Remember to also set all the backend environment variables (see Configuration above) in Railway's project settings — they are not committed to the repo.
+
+---
+
 ## Tech Stack
 
 | Layer | Technology |
@@ -312,6 +344,7 @@ Then use `datachat_reader` as your `TARGET_DB_USER`.
 | Database | PostgreSQL |
 | SQL Validation | Custom regex-based validator |
 | Schema Discovery | PostgreSQL `information_schema` |
+| Deployment | Railway (backend), Vercel (frontend) |
 
 ---
 
